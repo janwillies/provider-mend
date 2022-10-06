@@ -1,0 +1,6 @@
+apiVersion: products.mend.crossplane.io/v1alpha1
+kind: Product
+metadata:
+  name: example-product
+spec:
+  forProvider: {}

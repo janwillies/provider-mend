@@ -3,11 +3,11 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.8.0
+    controller-gen.kubebuilder.io/version: v0.9.2
   creationTimestamp: null
-  name: providerconfigs.template.crossplane.io
+  name: providerconfigs.mend.crossplane.io
 spec:
-  group: template.crossplane.io
+  group: mend.crossplane.io
   names:
     kind: ProviderConfig
     listKind: ProviderConfigList
@@ -26,7 +26,7 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: A ProviderConfig configures a Template provider.
+        description: A ProviderConfig configures a Mend provider.
         properties:
           apiVersion:
             description: 'APIVersion defines the versioned schema of this representation
@@ -96,8 +96,17 @@ spec:
                 required:
                 - source
                 type: object
+              serverUrl:
+                description: 'The API endpoint where mend/whitesource is hosted Example:
+                  https://whitesource.foo.com/api/v1.3'
+                type: string
+              timeout:
+                description: 'Timeout of the piperhttp.Client Exapmle: 3s'
+                type: string
             required:
             - credentials
+            - serverUrl
+            - timeout
             type: object
           status:
             description: A ProviderConfigStatus reflects the observed state of a ProviderConfig.
@@ -147,9 +156,3 @@ spec:
     storage: true
     subresources:
       status: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

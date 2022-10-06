@@ -14,48 +14,47 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package mytype
+package product
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/SAP/jenkins-library/pkg/whitesource"
+
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 
-	"github.com/crossplane/provider-template/apis/sample/v1alpha1"
-	apisv1alpha1 "github.com/crossplane/provider-template/apis/v1alpha1"
-	"github.com/crossplane/provider-template/internal/controller/features"
+	"github.com/crossplane-contrib/provider-mend/apis/product/v1alpha1"
+	apisv1alpha1 "github.com/crossplane-contrib/provider-mend/apis/v1alpha1"
+	"github.com/crossplane-contrib/provider-mend/internal/controller/features"
 )
 
 const (
-	errNotMyType    = "managed resource is not a MyType custom resource"
+	keyOrgToken  = "orgToken"
+	keyUserToken = "userToken"
+
+	errNotProduct   = "managed resource is not a Product custom resource"
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 	errGetPC        = "cannot get ProviderConfig"
 	errGetCreds     = "cannot get credentials"
-
-	errNewClient = "cannot create new Service"
 )
 
-// A NoOpService does nothing.
-type NoOpService struct{}
-
-var (
-	newNoOpService = func(_ []byte) (interface{}, error) { return &NoOpService{}, nil }
-)
-
-// Setup adds a controller that reconciles MyType managed resources.
+// Setup adds a controller that reconciles Product managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
-	name := managed.ControllerName(v1alpha1.MyTypeGroupKind)
+	name := managed.ControllerName(v1alpha1.ProductGroupKind)
 
 	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
 	if o.Features.Enabled(features.EnableAlphaExternalSecretStores) {
@@ -63,19 +62,20 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	}
 
 	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.MyTypeGroupVersionKind),
+		resource.ManagedKind(v1alpha1.ProductGroupVersionKind),
 		managed.WithExternalConnecter(&connector{
 			kube:         mgr.GetClient(),
 			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
-			newServiceFn: newNoOpService}),
+			newServiceFn: whitesource.NewSystem}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+		managed.WithInitializers(managed.NewNameAsExternalName(mgr.GetClient())),
 		managed.WithConnectionPublishers(cps...))
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithOptions(o.ForControllerRuntime()).
-		For(&v1alpha1.MyType{}).
+		For(&v1alpha1.Product{}).
 		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
@@ -84,7 +84,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 type connector struct {
 	kube         client.Client
 	usage        resource.Tracker
-	newServiceFn func(creds []byte) (interface{}, error)
+	newServiceFn func(serverURL string, orgToken string, userToken string, timeout time.Duration) *whitesource.System
 }
 
 // Connect typically produces an ExternalClient by:
@@ -93,9 +93,9 @@ type connector struct {
 // 3. Getting the credentials specified by the ProviderConfig.
 // 4. Using the credentials to form a client.
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
-	cr, ok := mg.(*v1alpha1.MyType)
+	cr, ok := mg.(*v1alpha1.Product)
 	if !ok {
-		return nil, errors.New(errNotMyType)
+		return nil, errors.New(errNotProduct)
 	}
 
 	if err := c.usage.Track(ctx, mg); err != nil {
@@ -107,18 +107,24 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errGetPC)
 	}
 
-	cd := pc.Spec.Credentials
-	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-	if err != nil {
-		return nil, errors.Wrap(err, errGetCreds)
+	csr := pc.Spec.Credentials.SecretRef
+	if csr == nil {
+		return nil, errors.New("no credentials secret referenced")
 	}
 
-	svc, err := c.newServiceFn(data)
-	if err != nil {
-		return nil, errors.Wrap(err, errNewClient)
+	secret := &corev1.Secret{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Namespace: csr.Namespace, Name: csr.Name}, secret); err != nil {
+		return nil, errors.Wrap(err, "cannot get credentials secret")
 	}
 
-	return &external{service: svc}, nil
+	dur, err := time.ParseDuration(pc.Spec.Timeout)
+	if err != nil {
+		return nil, errors.Wrap(err, "error parsing timeout")
+	}
+
+	system := whitesource.NewSystem(pc.Spec.ServerURL, string(secret.Data[keyOrgToken]), string(secret.Data[keyUserToken]), dur)
+
+	return &external{system: system}, nil
 }
 
 // An ExternalClient observes, then either creates, updates, or deletes an
@@ -126,17 +132,29 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 type external struct {
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
-	service interface{}
+	system *whitesource.System
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
-	cr, ok := mg.(*v1alpha1.MyType)
+	cr, ok := mg.(*v1alpha1.Product)
 	if !ok {
-		return managed.ExternalObservation{}, errors.New(errNotMyType)
+		return managed.ExternalObservation{}, errors.New(errNotProduct)
 	}
 
 	// These fmt statements should be removed in the real implementation.
 	fmt.Printf("Observing: %+v", cr)
+
+	system, err := c.system.GetProductByName(meta.GetExternalName(cr))
+	if err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(
+			resource.Ignore(
+				func(err2 error) bool { return true },
+				err),
+			errNotProduct)
+	}
+
+	cr.Status.AtProvider.CreationDate = system.CreationDate
+	cr.Status.AtProvider.LastUpdateDate = system.LastUpdateDate
 
 	return managed.ExternalObservation{
 		// Return false when the external resource does not exist. This lets
@@ -151,29 +169,37 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 		// Return any details that may be required to connect to the external
 		// resource. These will be stored as the connection secret.
-		ConnectionDetails: managed.ConnectionDetails{},
+		ConnectionDetails: managed.ConnectionDetails{
+			"token": []byte(system.Token),
+		},
 	}, nil
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
-	cr, ok := mg.(*v1alpha1.MyType)
+	cr, ok := mg.(*v1alpha1.Product)
 	if !ok {
-		return managed.ExternalCreation{}, errors.New(errNotMyType)
+		return managed.ExternalCreation{}, errors.New(errNotProduct)
 	}
 
 	fmt.Printf("Creating: %+v", cr)
+	token, err := c.system.CreateProduct(meta.GetExternalName(cr))
+	if err != nil {
+		return managed.ExternalCreation{}, errors.New("Product creation failed")
+	}
 
 	return managed.ExternalCreation{
 		// Optionally return any details that may be required to connect to the
 		// external resource. These will be stored as the connection secret.
-		ConnectionDetails: managed.ConnectionDetails{},
+		ConnectionDetails: managed.ConnectionDetails{
+			"token": []byte(token),
+		},
 	}, nil
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
-	cr, ok := mg.(*v1alpha1.MyType)
+	cr, ok := mg.(*v1alpha1.Product)
 	if !ok {
-		return managed.ExternalUpdate{}, errors.New(errNotMyType)
+		return managed.ExternalUpdate{}, errors.New(errNotProduct)
 	}
 
 	fmt.Printf("Updating: %+v", cr)
@@ -186,9 +212,9 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 }
 
 func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
-	cr, ok := mg.(*v1alpha1.MyType)
+	cr, ok := mg.(*v1alpha1.Product)
 	if !ok {
-		return errors.New(errNotMyType)
+		return errors.New(errNotProduct)
 	}
 
 	fmt.Printf("Deleting: %+v", cr)

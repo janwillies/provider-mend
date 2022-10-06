@@ -5,16 +5,19 @@ metadata:
   name: example-provider-secret
 type: Opaque
 data:
-  # credentials: BASE64ENCODED_PROVIDER_CREDS
+  orgToken: BASE64ENCODED_PROVIDER_CREDS
+  userToken: BASE64ENCODED_PROVIDER_CREDS
 ---
-apiVersion: template.crossplane.io/v1alpha1
+apiVersion: mend.crossplane.io/v1alpha1
 kind: ProviderConfig
 metadata:
-  name: example
+  name: default
 spec:
+  serverUrl: https://whitesource.mend.foo.bar/api/v1.3
+  timeout: 3s
   credentials:
     source: Secret
     secretRef:
       namespace: crossplane-system
-      name: example-provider-secret
-      key: credentials
+      name: provider-mend
+      key: none
